@@ -1,0 +1,1 @@
+S:/anaconda3/Scripts/activate && conda activate base_pip && streamlit run app.py --server.headless true --server.port 8501 --server.fileWatcherType none
