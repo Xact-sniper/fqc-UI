@@ -16,7 +16,6 @@ def _configure_local_fqc_import_path() -> None:
     candidates = [
         Path(env_path) if env_path else None,
         Path(__file__).resolve().parent.parent / "fqc-lib",
-        Path(__file__).resolve().parent.parent / "fqc",
         Path("/workspace/fqc-lib"),
     ]
     for base in [c for c in candidates if c]:
