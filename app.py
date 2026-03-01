@@ -10,7 +10,7 @@ from uuid import uuid4
 
 import dash_cytoscape as cyto
 import pandas as pd
-from dash import Dash, Input, Output, State, ctx, dcc, html, dash_table
+from dash import ALL, Dash, Input, Output, State, ctx, dcc, html, dash_table
 from dash.exceptions import PreventUpdate
 from dash_extensions import EventListener
 
@@ -129,7 +129,8 @@ def make_cyto_elements(state: Dict, weights: Optional[Dict[str, float]] = None) 
     for edge in state["edges"]:
         eid = edge["id"]
         w = float((weights or {}).get(eid, max(float(edge.get("share", 0.1)), 0.05)))
-        els.append({"data": {"id": eid, "source": edge["source"], "target": edge["target"], "label": edge.get("label", edge.get("item", "flow")), "width": 2 + min(20.0, (w ** 0.5) * 3.0)}})
+        label_item = edge.get("item", "flow")
+        els.append({"data": {"id": eid, "source": edge["source"], "target": edge["target"], "label": f"{label_item} ({w:.2f}/s)", "width": 2 + min(20.0, (w ** 0.5) * 3.0)}})
     return els
 
 
@@ -219,6 +220,7 @@ app.layout = html.Div([
     dcc.Store(id="selected-edge", data=None),
     dcc.Store(id="connect-source", data=None),
     dcc.Store(id="last-tap", data={"node": None, "ts": 0.0}),
+    dcc.Store(id="last-context", data={"kind": None, "id": None, "ts": 0.0}),
     html.Div(style={"display": "flex", "height": "100vh", "fontFamily": "sans-serif"}, children=[
         html.Div(style={"width": "300px", "borderRight": "1px solid #ddd", "padding": "10px", "overflowY": "auto"}, children=[
             html.H4("Machine priority"),
@@ -229,20 +231,9 @@ app.layout = html.Div([
             html.Hr(),
             html.Div("Selected node"),
             html.Div(id="selected-node-label", style={"fontSize": "12px"}),
-            dcc.Dropdown(id="node-machine-type", options=[{"label": m.value, "value": m.value} for m in MachineType], placeholder="Machine type"),
-            dcc.Dropdown(id="node-recipe", options=[{"label": r, "value": r} for r in RECIPE_OPTIONS], placeholder="Recipe"),
-            dcc.Dropdown(id="node-io-item", options=[{"label": i, "value": i} for i in ITEM_OPTIONS], placeholder="I/O item"),
-            dcc.Dropdown(id="node-io-mode", options=[{"label": "input", "value": "input"}, {"label": "output", "value": "output"}, {"label": "throughput", "value": "throughput"}], placeholder="I/O mode"),
-            dcc.Input(id="node-rate", type="number", step=0.1, placeholder="I/O rate", style={"width": "100%"}),
-            dcc.Dropdown(id="node-quality", options=[{"label": q.value, "value": q.value} for q in Quality], placeholder="Quality"),
-            dcc.Input(id="node-count", type="number", step=0.1, placeholder="Machine count", style={"width": "100%"}),
-            html.Button("Save node", id="save-node", style={"width": "100%", "marginTop": "6px"}),
-            html.Hr(),
             html.Div("Selected edge"),
-            dcc.Dropdown(id="edge-item", options=[{"label": i.value, "value": i.value} for i in Item]),
             html.Div(id="edge-rate", style={"fontSize": "12px", "padding": "6px 0", "color": "#444"}),
-            dcc.Dropdown(id="edge-quality", options=[{"label": "(any)", "value": "(any)"}] + [{"label": q.value, "value": q.value} for q in Quality], value="(any)"),
-            html.Button("Apply edge", id="apply-edge", style={"width": "100%"}),
+            html.Div("Right-click selected node to configure. Double right-click selected node/edge to delete.", style={"fontSize": "11px", "color": "#666"}),
             html.Hr(),
             html.Button("Load demo graph", id="load-demo", style={"width": "100%"}),
             html.Button("Run analysis", id="run", style={"width": "100%", "marginTop": "6px"}),
@@ -273,6 +264,20 @@ app.layout = html.Div([
             html.Div(id="analysis", style={"padding": "8px", "overflowY": "auto"}),
             html.Div(id="recipe-popup", style={"position": "absolute", "display": "none", "background": "white", "border": "1px solid #ccc", "padding": "8px", "zIndex": 10}, children=[html.B("Add machine"), dcc.Dropdown(id="recipe-select", options=[{"label": r, "value": r} for r in RECIPE_OPTIONS], style={"width": "320px"}), html.Button("Create", id="create-recipe-node")]),
             html.Div(id="item-popup", style={"position": "absolute", "display": "none", "background": "white", "border": "1px solid #ccc", "padding": "8px", "zIndex": 10}, children=[html.B("Add I/O"), dcc.Dropdown(id="item-select", options=[{"label": i, "value": i} for i in ITEM_OPTIONS], value=Item.IRON_PLATE.value), dcc.Dropdown(id="io-mode", options=[{"label": "input", "value": "input"}, {"label": "output", "value": "output"}, {"label": "throughput", "value": "throughput"}], value="input"), dcc.Input(id="io-rate", type="number", value=1.0, style={"width": "100%"}), dcc.Dropdown(id="io-quality", options=[{"label": q.value, "value": q.value} for q in Quality], value=Quality.NORMAL.value), html.Button("Create", id="create-io-node")]),
+
+            html.Div(id="node-config-popup", style={"position": "absolute", "display": "none", "background": "white", "border": "1px solid #ccc", "padding": "8px", "zIndex": 11, "width": "360px"}, children=[
+                html.B("Configure node"),
+                dcc.Dropdown(id="node-machine-type", options=[{"label": m.value, "value": m.value} for m in MachineType], placeholder="Machine type"),
+                dcc.Dropdown(id="node-recipe", options=[{"label": r, "value": r} for r in RECIPE_OPTIONS], placeholder="Recipe"),
+                dcc.Dropdown(id="node-io-item", options=[{"label": i, "value": i} for i in ITEM_OPTIONS], placeholder="I/O item"),
+                dcc.Dropdown(id="node-io-mode", options=[{"label": "input", "value": "input"}, {"label": "output", "value": "output"}, {"label": "throughput", "value": "throughput"}], placeholder="I/O mode"),
+                dcc.Input(id="node-rate", type="number", step=0.1, placeholder="I/O rate", style={"width": "100%"}),
+                dcc.Dropdown(id="node-quality", options=[{"label": q.value, "value": q.value} for q in Quality], placeholder="Quality"),
+                dcc.Input(id="node-count", type="number", step=0.1, placeholder="Machine count", style={"width": "100%"}),
+                html.Div("Outgoing edge shares"),
+                html.Div(id="share-sliders"),
+                html.Button("Save node", id="save-node", style={"width": "100%", "marginTop": "6px"}),
+            ]),
         ]),
     ]),
 ])
@@ -298,24 +303,34 @@ def reorder_priority(_, __, selected: str, state: Dict):
     return state
 
 
-@app.callback(Output("popup", "data"), Input("canvas-events", "event"), State("selected-node", "data"), State("selected-edge", "data"), State("state", "data"), prevent_initial_call=True)
-def canvas_event(event: Dict, selected_node: Optional[str], selected_edge: Optional[str], state: Dict):
+@app.callback(Output("popup", "data"), Output("last-context", "data", allow_duplicate=True), Input("canvas-events", "event"), State("selected-node", "data"), State("selected-edge", "data"), State("state", "data"), State("last-context", "data"), prevent_initial_call=True)
+def canvas_event(event: Dict, selected_node: Optional[str], selected_edge: Optional[str], state: Dict, last_context: Dict):
     xy = {"x": int(event.get("offsetX", 20)), "y": int(event.get("offsetY", 20))}
     if event.get("event") == "contextmenu":
-        st = deepcopy(state)
-        if selected_edge:
-            st["edges"] = [e for e in st["edges"] if e["id"] != selected_edge]
-            return {"type": "none", "open": False, "x": xy["x"], "y": xy["y"], "_delete": {"edge": selected_edge, "state": st}}
+        now = time.time()
+        kind = "node" if selected_node else ("edge" if selected_edge else None)
+        target_id = selected_node or selected_edge
+        last_kind = (last_context or {}).get("kind")
+        last_id = (last_context or {}).get("id")
+        last_ts = float((last_context or {}).get("ts", 0.0))
+        # Double right-click deletes selected element.
+        if kind and kind == last_kind and target_id == last_id and (now - last_ts) < 0.7:
+            st = deepcopy(state)
+            if kind == "edge":
+                st["edges"] = [e for e in st["edges"] if e["id"] != target_id]
+                return {"type": "none", "open": False, "x": xy["x"], "y": xy["y"], "_delete": {"edge": target_id, "state": st}}, {"kind": None, "id": None, "ts": 0.0}
+            st["nodes"] = [n for n in st["nodes"] if n["id"] != target_id]
+            st["edges"] = [e for e in st["edges"] if e["source"] != target_id and e["target"] != target_id]
+            return {"type": "none", "open": False, "x": xy["x"], "y": xy["y"], "_delete": {"node": target_id, "state": st}}, {"kind": None, "id": None, "ts": 0.0}
+
         if selected_node:
-            st["nodes"] = [n for n in st["nodes"] if n["id"] != selected_node]
-            st["edges"] = [e for e in st["edges"] if e["source"] != selected_node and e["target"] != selected_node]
-            return {"type": "none", "open": False, "x": xy["x"], "y": xy["y"], "_delete": {"node": selected_node, "state": st}}
-        return {"type": None, "open": False, "x": xy["x"], "y": xy["y"]}
+            return {"type": "node-config", "open": True, "x": xy["x"], "y": xy["y"]}, {"kind": "node", "id": selected_node, "ts": now}
+        return {"type": None, "open": False, "x": xy["x"], "y": xy["y"]}, {"kind": kind, "id": target_id, "ts": now}
     if event.get("shiftKey"):
-        return {"type": "recipe", "open": True, "x": xy["x"], "y": xy["y"]}
+        return {"type": "recipe", "open": True, "x": xy["x"], "y": xy["y"]}, last_context
     if event.get("ctrlKey"):
-        return {"type": "io", "open": True, "x": xy["x"], "y": xy["y"]}
-    return {"type": None, "open": False, "x": xy["x"], "y": xy["y"]}
+        return {"type": "io", "open": True, "x": xy["x"], "y": xy["y"]}, last_context
+    return {"type": None, "open": False, "x": xy["x"], "y": xy["y"]}, last_context
 
 
 @app.callback(Output("state", "data", allow_duplicate=True), Output("selected-node", "data", allow_duplicate=True), Output("selected-edge", "data", allow_duplicate=True), Output("status", "children", allow_duplicate=True), Input("popup", "data"), prevent_initial_call=True)
@@ -328,14 +343,16 @@ def apply_context_delete(popup: Dict):
     return deleted["state"], None, None, "Node removed via right-click."
 
 
-@app.callback(Output("recipe-popup", "style"), Output("item-popup", "style"), Input("popup", "data"))
+@app.callback(Output("recipe-popup", "style"), Output("item-popup", "style"), Output("node-config-popup", "style"), Input("popup", "data"))
 def popup_style(popup: Dict):
     base = {"position": "absolute", "left": f"{int(popup.get('x', 20))}px", "top": f"{int(popup.get('y', 20))}px", "background": "white", "border": "1px solid #ccc", "padding": "8px", "zIndex": 10}
     r = dict(base)
     i = dict(base)
     r["display"] = "block" if popup.get("open") and popup.get("type") == "recipe" else "none"
     i["display"] = "block" if popup.get("open") and popup.get("type") == "io" else "none"
-    return r, i
+    n = dict(base)
+    n["display"] = "block" if popup.get("open") and popup.get("type") == "node-config" else "none"
+    return r, i, n
 
 
 @app.callback(Output("state", "data", allow_duplicate=True), Output("popup", "data", allow_duplicate=True), Output("status", "children", allow_duplicate=True), Input("create-recipe-node", "n_clicks"), State("recipe-select", "value"), State("popup", "data"), State("state", "data"), prevent_initial_call=True)
@@ -407,7 +424,7 @@ def select_or_connect(node_data: Dict, source: Optional[str], last_tap: Dict, st
     return st, None, node_id, None, {"node": node_id, "ts": now}, f"Selected node {node_id}. Double-click to start connection."
 
 
-@app.callback(Output("selected-edge", "data"), Output("edge-item", "value"), Output("edge-quality", "value"), Output("edge-rate", "children"), Input("graph", "tapEdgeData"), State("state", "data"), State("weights", "data"), prevent_initial_call=True)
+@app.callback(Output("selected-edge", "data"), Output("edge-item", "children"), Output("edge-quality", "children"), Output("edge-rate", "children"), Input("graph", "tapEdgeData"), State("state", "data"), State("weights", "data"), prevent_initial_call=True)
 def select_edge(edge_data: Dict, state: Dict, weights: Dict):
     if not edge_data:
         raise PreventUpdate
@@ -415,7 +432,7 @@ def select_edge(edge_data: Dict, state: Dict, weights: Dict):
     if not edge:
         raise PreventUpdate
     rate = float((weights or {}).get(edge["id"], 0.0))
-    return edge["id"], edge.get("item"), edge.get("quality", "(any)"), f"Calculated rate: {rate:.3f}/s"
+    return edge["id"], f"Item: {edge.get("item")}", f"Quality: {edge.get("quality", "(any)")}", f"Calculated rate: {rate:.3f}/s"
 
 
 @app.callback(Output("selected-node-label", "children"), Output("node-machine-type", "value"), Output("node-recipe", "value"), Output("node-io-item", "value"), Output("node-io-mode", "value"), Output("node-rate", "value"), Output("node-quality", "value"), Output("node-count", "value"), Input("selected-node", "data"), State("state", "data"))
@@ -455,19 +472,73 @@ def save_node(_, selected_node: Optional[str], machine_type: Optional[str], reci
     return st, "I/O updated."
 
 
-@app.callback(Output("state", "data", allow_duplicate=True), Output("status", "children", allow_duplicate=True), Input("apply-edge", "n_clicks"), State("selected-edge", "data"), State("edge-item", "value"), State("edge-quality", "value"), State("state", "data"), prevent_initial_call=True)
-def apply_edge(_, edge_id: Optional[str], item: Optional[str], quality: str, state: Dict):
-    st = deepcopy(state)
-    if not edge_id:
-        return st, "Select edge first."
-    for edge in st["edges"]:
-        if edge["id"] == edge_id:
-            edge["item"] = item or edge.get("item")
-            edge["label"] = edge["item"]
-            edge["quality"] = quality or "(any)"
-            return st, "Edge updated (share/rate is derived and locked)."
-    return st, "Edge not found."
 
+
+
+
+@app.callback(
+    Output("node-machine-type", "value"),
+    Output("node-recipe", "value"),
+    Output("node-io-item", "value"),
+    Output("node-io-mode", "value"),
+    Output("node-rate", "value"),
+    Output("node-quality", "value"),
+    Output("node-count", "value"),
+    Output("share-sliders", "children"),
+    Input("popup", "data"),
+    State("selected-node", "data"),
+    State("state", "data"),
+)
+def populate_node_popup(popup: Dict, selected_node: Optional[str], state: Dict):
+    if not popup or popup.get("type") != "node-config" or not selected_node:
+        return None, None, None, None, None, None, None, []
+    node = node_by_id(state, selected_node)
+    if not node:
+        return None, None, None, None, None, None, None, []
+
+    sliders = []
+    outgoing = [e for e in state["edges"] if e["source"] == selected_node]
+    for edge in outgoing:
+        sliders.append(
+            html.Div([
+                html.Div(f"{edge.get('item')} -> {edge.get('target')}", style={"fontSize": "11px"}),
+                dcc.Slider(id={"type": "share-slider", "edge_id": edge["id"]}, min=0.0, max=1.0, step=0.01, value=float(edge.get("share", 1.0))),
+            ], style={"marginBottom": "8px"})
+        )
+
+    if node["kind"] == NodeKind.MACHINE:
+        return node.get("machine_type"), node.get("recipe"), None, None, None, node.get("quality", "normal"), node.get("count"), sliders
+    return None, None, node.get("item"), node.get("io_mode"), node.get("rate"), node.get("quality", "normal"), None, sliders
+
+
+@app.callback(
+    Output("state", "data", allow_duplicate=True),
+    Input({"type": "share-slider", "edge_id": ALL}, "value"),
+    State({"type": "share-slider", "edge_id": ALL}, "id"),
+    State("selected-node", "data"),
+    State("state", "data"),
+    prevent_initial_call=True,
+)
+def update_shares(slider_values: List[float], slider_ids: List[Dict], selected_node: Optional[str], state: Dict):
+    if not selected_node or not slider_ids:
+        raise PreventUpdate
+    st = deepcopy(state)
+    value_by_edge = {sid["edge_id"]: float(val) for sid, val in zip(slider_ids, slider_values)}
+
+    # Apply then renormalize shares per item group to sum <= 1.
+    grouped: Dict[str, List[Dict]] = {}
+    for edge in st["edges"]:
+        if edge["source"] == selected_node and edge["id"] in value_by_edge:
+            edge["share"] = value_by_edge[edge["id"]]
+            grouped.setdefault(edge.get("item", ""), []).append(edge)
+
+    for _, edges in grouped.items():
+        total = sum(float(e.get("share", 0.0)) for e in edges)
+        if total > 1.0 and total > 1e-9:
+            for e in edges:
+                e["share"] = float(e.get("share", 0.0)) / total
+
+    return st
 
 @app.callback(Output("state", "data", allow_duplicate=True), Output("status", "children", allow_duplicate=True), Input("load-demo", "n_clicks"), prevent_initial_call=True)
 def load_demo(_):
@@ -493,7 +564,7 @@ def clear_all(_):
     return default_state(), None, None, None, "Cleared"
 
 
-@app.callback(Output("weights", "data"), Output("analysis", "children"), Output("status", "children", allow_duplicate=True), Input("run", "n_clicks"), Input("state", "data"), prevent_initial_call=True)
+@app.callback(Output("weights", "data"), Output("analysis", "children"), Input("run", "n_clicks"), Input("state", "data"), prevent_initial_call=True)
 def run_analysis(_, state: Dict):
     try:
         graph = build_fqc_graph(state)
@@ -523,9 +594,9 @@ def run_analysis(_, state: Dict):
         machine_rows = [{"machine_id": mid, "count": m.count, "run_rate": m.required_run_rate} for mid, m in graph.machines.items()]
         ext_rows = [{"item": i.value, "quality": q.value, "rate": r} for (i, q), r in graph.required_external_inputs.items()]
         ui = [html.H4("Machines"), dash_table.DataTable(data=pd.DataFrame(machine_rows).to_dict("records"), page_size=8), html.H4("Required external inputs"), dash_table.DataTable(data=pd.DataFrame(ext_rows).to_dict("records"), page_size=8)]
-        return weights, ui, "Analysis updated"
+        return weights, ui
     except Exception as exc:
-        return {}, [html.Pre(str(exc))], f"Analysis failed: {exc}"
+        return {}, [html.Pre(str(exc))]
 
 
 @app.callback(Output("graph", "elements"), Input("state", "data"), Input("weights", "data"))
