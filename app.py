@@ -166,18 +166,19 @@ def _remaining_share(state: Dict, source_id: str, item: str) -> float:
 
 
 def _can_source(node: Dict) -> bool:
-    return node["kind"] == NodeKind.MACHINE or node.get("io_mode") != "input"
+    # Input nodes only source flow; output nodes only sink flow.
+    return node["kind"] == NodeKind.MACHINE or node.get("io_mode") != "output"
 
 
 def _can_target(node: Dict) -> bool:
-    return node["kind"] == NodeKind.MACHINE or node.get("io_mode") != "output"
+    return node["kind"] == NodeKind.MACHINE or node.get("io_mode") != "input"
 
 
 def validate_connection(state: Dict, source: Dict, target: Dict) -> Tuple[Optional[str], Optional[float], str]:
     if not _can_source(source):
-        return None, None, "Input I/O nodes cannot have outgoing connections."
+        return None, None, "Output I/O nodes cannot have outgoing connections."
     if not _can_target(target):
-        return None, None, "Output I/O nodes cannot have incoming connections."
+        return None, None, "Input I/O nodes cannot have incoming connections."
 
     if source["kind"] == NodeKind.IO:
         item = source.get("item")
@@ -239,7 +240,7 @@ app.layout = html.Div([
             html.Hr(),
             html.Div("Selected edge"),
             dcc.Dropdown(id="edge-item", options=[{"label": i.value, "value": i.value} for i in Item]),
-            dcc.Input(id="edge-share", type="number", disabled=True, style={"width": "100%"}),
+            html.Div(id="edge-rate", style={"fontSize": "12px", "padding": "6px 0", "color": "#444"}),
             dcc.Dropdown(id="edge-quality", options=[{"label": "(any)", "value": "(any)"}] + [{"label": q.value, "value": q.value} for q in Quality], value="(any)"),
             html.Button("Apply edge", id="apply-edge", style={"width": "100%"}),
             html.Hr(),
@@ -406,14 +407,15 @@ def select_or_connect(node_data: Dict, source: Optional[str], last_tap: Dict, st
     return st, None, node_id, None, {"node": node_id, "ts": now}, f"Selected node {node_id}. Double-click to start connection."
 
 
-@app.callback(Output("selected-edge", "data"), Output("edge-item", "value"), Output("edge-share", "value"), Output("edge-quality", "value"), Input("graph", "tapEdgeData"), State("state", "data"), prevent_initial_call=True)
-def select_edge(edge_data: Dict, state: Dict):
+@app.callback(Output("selected-edge", "data"), Output("edge-item", "value"), Output("edge-quality", "value"), Output("edge-rate", "children"), Input("graph", "tapEdgeData"), State("state", "data"), State("weights", "data"), prevent_initial_call=True)
+def select_edge(edge_data: Dict, state: Dict, weights: Dict):
     if not edge_data:
         raise PreventUpdate
     edge = next((e for e in state["edges"] if e["id"] == edge_data["id"]), None)
     if not edge:
         raise PreventUpdate
-    return edge["id"], edge.get("item"), edge.get("share", 1.0), edge.get("quality", "(any)")
+    rate = float((weights or {}).get(edge["id"], 0.0))
+    return edge["id"], edge.get("item"), edge.get("quality", "(any)"), f"Calculated rate: {rate:.3f}/s"
 
 
 @app.callback(Output("selected-node-label", "children"), Output("node-machine-type", "value"), Output("node-recipe", "value"), Output("node-io-item", "value"), Output("node-io-mode", "value"), Output("node-rate", "value"), Output("node-quality", "value"), Output("node-count", "value"), Input("selected-node", "data"), State("state", "data"))
@@ -491,7 +493,7 @@ def clear_all(_):
     return default_state(), None, None, None, "Cleared"
 
 
-@app.callback(Output("weights", "data"), Output("analysis", "children"), Output("status", "children", allow_duplicate=True), Input("run", "n_clicks"), State("state", "data"), prevent_initial_call=True)
+@app.callback(Output("weights", "data"), Output("analysis", "children"), Output("status", "children", allow_duplicate=True), Input("run", "n_clicks"), Input("state", "data"), prevent_initial_call=True)
 def run_analysis(_, state: Dict):
     try:
         graph = build_fqc_graph(state)
@@ -521,7 +523,7 @@ def run_analysis(_, state: Dict):
         machine_rows = [{"machine_id": mid, "count": m.count, "run_rate": m.required_run_rate} for mid, m in graph.machines.items()]
         ext_rows = [{"item": i.value, "quality": q.value, "rate": r} for (i, q), r in graph.required_external_inputs.items()]
         ui = [html.H4("Machines"), dash_table.DataTable(data=pd.DataFrame(machine_rows).to_dict("records"), page_size=8), html.H4("Required external inputs"), dash_table.DataTable(data=pd.DataFrame(ext_rows).to_dict("records"), page_size=8)]
-        return weights, ui, "Analysis complete"
+        return weights, ui, "Analysis updated"
     except Exception as exc:
         return {}, [html.Pre(str(exc))], f"Analysis failed: {exc}"
 

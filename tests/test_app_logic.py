@@ -15,10 +15,19 @@ def test_create_io_without_machine_id_requirement():
 
 
 def test_validate_connection_direction():
-    s = {"id": "io1", "kind": app.NodeKind.IO, "io_mode": "input", "item": "iron-plate"}
-    t = {"id": "m1", "kind": app.NodeKind.MACHINE, "recipe": "iron-gear-wheel"}
-    _, _, err = app.validate_connection({"edges": []}, s, t)
+    source_output = {"id": "io1", "kind": app.NodeKind.IO, "io_mode": "output", "item": "iron-plate"}
+    target_machine = {"id": "m1", "kind": app.NodeKind.MACHINE, "recipe": "iron-gear-wheel"}
+    _, _, err = app.validate_connection({"edges": []}, source_output, target_machine)
     assert "cannot have outgoing" in err
+
+
+def test_input_io_can_connect_out_to_machine_when_recipe_accepts_item():
+    source_input = {"id": "io1", "kind": app.NodeKind.IO, "io_mode": "input", "item": "iron-plate"}
+    target_machine = {"id": "m1", "kind": app.NodeKind.MACHINE, "recipe": "iron-gear-wheel"}
+    item, share, err = app.validate_connection({"edges": []}, source_input, target_machine)
+    assert err == ""
+    assert item == "iron-plate"
+    assert share == 1.0
 
 
 def test_remaining_share():
