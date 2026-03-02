@@ -9,6 +9,7 @@ from typing import Dict, List, Optional, Set, Tuple
 from uuid import uuid4
 
 import dash_cytoscape as cyto
+import dash_ag_grid as dag
 import pandas as pd
 from dash import ALL, Dash, Input, Output, State, ctx, dcc, html, dash_table
 from dash.exceptions import PreventUpdate
@@ -19,6 +20,7 @@ def _configure_local_fqc_import_path() -> None:
     env_path = os.getenv("FQC_PATH")
     candidates = [
         Path(env_path) if env_path else None,
+        Path(__file__).resolve().parent.parent / "fqc",
         Path(__file__).resolve().parent.parent / "fqc-lib",
         Path("/workspace/fqc-lib"),
     ]
@@ -121,7 +123,7 @@ def resolve_io_attachment(state: Dict, io_id: str) -> Optional[str]:
     return None
 
 
-def make_cyto_elements(state: Dict, weights: Optional[Dict[str, float]] = None) -> List[Dict]:
+def make_cyto_elements(state: Dict, weights: Optional[Dict[str, float]] = None, edge_metrics: Optional[Dict[str, Dict]] = None) -> List[Dict]:
     els: List[Dict] = []
     for node in state["nodes"]:
         color = "#2563eb" if node["kind"] == NodeKind.MACHINE else {"input": "#10b981", "output": "#f59e0b", "throughput": "#8b5cf6"}.get(node.get("io_mode"), "#16a34a")
@@ -130,8 +132,57 @@ def make_cyto_elements(state: Dict, weights: Optional[Dict[str, float]] = None) 
         eid = edge["id"]
         w = float((weights or {}).get(eid, max(float(edge.get("share", 0.1)), 0.05)))
         label_item = edge.get("item", "flow")
-        els.append({"data": {"id": eid, "source": edge["source"], "target": edge["target"], "label": f"{label_item} ({w:.2f}/s)", "width": 2 + min(20.0, (w ** 0.5) * 3.0)}})
+        meta = (edge_metrics or {}).get(eid, {})
+        actual = meta.get("actual_rate")
+        req = meta.get("required_rate")
+        req_txt = "none" if req is None else f"{req:.2f}/s"
+        act_txt = f"{(actual if actual is not None else w):.2f}/s"
+        label = f"{label_item} | actual {act_txt} | required {req_txt}"
+        els.append({"data": {"id": eid, "source": edge["source"], "target": edge["target"], "label": label, "width": 2 + min(20.0, (w ** 0.5) * 3.0)}})
     return els
+
+
+def _lookup_rate(rate_map: Dict, item_name: str) -> float:
+    for k, v in rate_map.items():
+        if isinstance(k, tuple):
+            if len(k) > 0 and getattr(k[0], "value", None) == item_name:
+                return float(v)
+        elif getattr(k, "value", None) == item_name:
+            return float(v)
+    return 0.0
+
+
+def compute_edge_metrics(state: Dict, report: MachineAnalysis, has_demands: bool) -> Dict[str, Dict]:
+    metrics: Dict[str, Dict] = {}
+    for e in state["edges"]:
+        src = node_by_id(state, e["source"])
+        tgt = node_by_id(state, e["target"])
+        sem = derive_edge_semantics(state, e) or {}
+        item_name = sem.get("item")
+        actual_rate = 0.0
+        required_rate: Optional[float] = None
+        if src and src.get("kind") == NodeKind.IO:
+            actual_rate = float(src.get("rate", 0.0))
+            required_rate = actual_rate if has_demands else None
+        elif tgt and tgt.get("kind") == NodeKind.IO:
+            actual_rate = float(tgt.get("rate", 0.0))
+            required_rate = actual_rate if has_demands else None
+        else:
+            s = report.machines.get(e["source"])
+            t = report.machines.get(e["target"])
+            if s and item_name:
+                actual_rate = _lookup_rate(getattr(s, "production_rates", {}), item_name)
+            if has_demands and t and item_name:
+                required_rate = _lookup_rate(getattr(t, "consumption_rates", {}), item_name)
+        metrics[e["id"]] = {
+            "source": e.get("source"),
+            "target": e.get("target"),
+            "item": item_name,
+            "share": float(sem.get("share", 1.0)),
+            "actual_rate": float(actual_rate),
+            "required_rate": None if required_rate is None else float(required_rate),
+        }
+    return metrics
 
 
 def build_fqc_graph(state: Dict) -> CraftingGraph:
@@ -144,8 +195,11 @@ def build_fqc_graph(state: Dict) -> CraftingGraph:
         machine_ids.add(node["id"])
     for edge in state["edges"]:
         if edge["source"] in machine_ids and edge["target"] in machine_ids:
-            q = Quality(edge.get("quality", Quality.NORMAL.value))
-            graph.add_edge(Edge(source=edge["source"], target=edge["target"], item=Item(edge["item"]), share=float(edge.get("share", 1.0)), quality=q))
+            sem = derive_edge_semantics(state, edge)
+            if not sem or not sem.get("item"):
+                continue
+            q = Quality(sem.get("quality", Quality.NORMAL.value))
+            graph.add_edge(Edge(source=edge["source"], target=edge["target"], item=Item(sem["item"]), share=float(sem.get("share", 1.0)), quality=q))
     for io in state["nodes"]:
         if io["kind"] != NodeKind.IO:
             continue
@@ -161,11 +215,6 @@ def build_fqc_graph(state: Dict) -> CraftingGraph:
     return graph
 
 
-def _remaining_share(state: Dict, source_id: str, item: str) -> float:
-    used = sum(float(e.get("share", 0.0)) for e in state["edges"] if e["source"] == source_id and e.get("item") == item)
-    return max(0.0, 1.0 - used)
-
-
 def _can_source(node: Dict) -> bool:
     # Input nodes only source flow; output nodes only sink flow.
     return node["kind"] == NodeKind.MACHINE or node.get("io_mode") != "output"
@@ -175,45 +224,95 @@ def _can_target(node: Dict) -> bool:
     return node["kind"] == NodeKind.MACHINE or node.get("io_mode") != "input"
 
 
-def validate_connection(state: Dict, source: Dict, target: Dict) -> Tuple[Optional[str], Optional[float], str]:
+def validate_connection(state: Dict, source: Dict, target: Dict) -> Tuple[bool, str]:
     if not _can_source(source):
-        return None, None, "Output I/O nodes cannot have outgoing connections."
+        return False, "Output I/O nodes cannot have outgoing connections."
     if not _can_target(target):
-        return None, None, "Input I/O nodes cannot have incoming connections."
+        return False, "Input I/O nodes cannot have incoming connections."
 
     if source["kind"] == NodeKind.IO:
         item = source.get("item")
         if target["kind"] == NodeKind.MACHINE and item not in RECIPE_INPUTS.get(target.get("recipe"), set()):
-            return None, None, f"{item} is not an input for {target.get('recipe')}."
-        return item, 1.0, ""
+            return False, f"{item} is not an input for {target.get('recipe')}."
+        return True, ""
 
     src_outputs = RECIPE_OUTPUTS.get(source.get("recipe"), [])
     if not src_outputs:
-        return None, None, f"No outputs found for {source.get('recipe')}"
+        return False, f"No outputs found for {source.get('recipe')}"
 
     if target["kind"] == NodeKind.IO:
         item = target.get("item")
         if item not in src_outputs:
-            return None, None, f"{item} is not produced by {source.get('recipe')}."
-        share = _remaining_share(state, source["id"], item)
-        if share <= 0:
-            return item, 0.0, ""
-        return item, share, ""
+            return False, f"{item} is not produced by {source.get('recipe')}."
+        return True, ""
 
     tgt_inputs = RECIPE_INPUTS.get(target.get("recipe"), set())
     for item in src_outputs:
         if item in tgt_inputs:
-            share = _remaining_share(state, source["id"], item)
-            if share > 0:
-                return item, share, ""
-            return item, 0.0, ""
-    return None, None, "No valid item/share found for this machine connection."
+            return True, ""
+    return False, "No valid source->target item match found."
+
+
+def derive_edge_semantics(state: Dict, edge: Dict) -> Optional[Dict]:
+    src = node_by_id(state, edge.get("source"))
+    tgt = node_by_id(state, edge.get("target"))
+    if not src or not tgt:
+        return None
+    if src.get("kind") == NodeKind.IO:
+        return {"item": src.get("item"), "quality": src.get("quality", Quality.NORMAL.value), "share": 1.0}
+    if tgt.get("kind") == NodeKind.IO:
+        return {"item": tgt.get("item"), "quality": tgt.get("quality", Quality.NORMAL.value), "share": 1.0}
+    outs = RECIPE_OUTPUTS.get(src.get("recipe"), [])
+    ins = RECIPE_INPUTS.get(tgt.get("recipe"), set())
+    for item in outs:
+        if item in ins:
+            return {"item": item, "quality": src.get("quality", Quality.NORMAL.value), "share": 1.0}
+    return None
 
 
 def machine_label(machine_type: Optional[str]) -> str:
     if not machine_type:
         return "Machine"
     return machine_type.replace("-", " ").title()
+
+
+def _find_node_at(state: Dict, x: float, y: float, radius: float = 55.0) -> Optional[Dict]:
+    best = None
+    best_d2 = radius * radius
+    for n in state.get("nodes", []):
+        dx = float(n.get("x", 0.0)) - x
+        dy = float(n.get("y", 0.0)) - y
+        d2 = dx * dx + dy * dy
+        if d2 <= best_d2:
+            best = n
+            best_d2 = d2
+    return best
+
+
+def _point_segment_distance(px: float, py: float, ax: float, ay: float, bx: float, by: float) -> float:
+    abx = bx - ax
+    aby = by - ay
+    apx = px - ax
+    apy = py - ay
+    ab2 = abx * abx + aby * aby
+    t = 0.0 if ab2 == 0 else max(0.0, min(1.0, (apx * abx + apy * aby) / ab2))
+    cx = ax + t * abx
+    cy = ay + t * aby
+    dx = px - cx
+    dy = py - cy
+    return (dx * dx + dy * dy) ** 0.5
+
+
+def _find_edge_at(state: Dict, x: float, y: float, threshold: float = 12.0) -> Optional[Dict]:
+    for e in state.get("edges", []):
+        s = node_by_id(state, e.get("source"))
+        t = node_by_id(state, e.get("target"))
+        if not s or not t:
+            continue
+        d = _point_segment_distance(x, y, float(s.get("x", 0.0)), float(s.get("y", 0.0)), float(t.get("x", 0.0)), float(t.get("y", 0.0)))
+        if d <= threshold:
+            return e
+    return None
 
 
 app = Dash(__name__)
@@ -232,26 +331,25 @@ app.layout = html.Div([
     html.Div(style={"display": "flex", "height": "100vh", "fontFamily": "sans-serif"}, children=[
         html.Div(style={"width": "300px", "borderRight": "1px solid #ddd", "padding": "10px", "overflowY": "auto"}, children=[
             html.H4("Machine priority"),
-            dash_table.DataTable(
+            dag.AgGrid(
                 id="priority-table",
-                columns=[{"name": "machine", "id": "machine"}],
-                data=[],
-                editable=True,
+                columnDefs=[{"field": "machine", "rowDrag": True}],
+                rowData=[],
+                defaultColDef={"resizable": True},
+                dashGridOptions={"animateRows": True, "rowDragManaged": True},
+                style={"height": "260px"},
             ),
+            html.Button("Load demo graph", id="load-demo", style={"width": "100%", "marginTop": "8px"}),
+            html.Button("Auto flow layout", id="flow-layout", style={"width": "100%", "marginTop": "6px"}),
+            html.Button("Clear", id="clear", style={"width": "100%", "marginTop": "6px"}),
+            html.Pre(id="status", style={"fontSize": "12px", "whiteSpace": "pre-wrap", "marginTop": "8px"}),
         ]),
         html.Div(style={"flex": "1", "position": "relative", "display": "flex", "flexDirection": "column"}, children=[
             html.Div(style={"display": "none"}, children=[
                 html.Div(id="selected-node-label"),
                 html.Div(id="edge-rate"),
                 html.Div(id="hover-info"),
-                html.Pre(id="status"),
-                html.Button("Load demo graph", id="load-demo"),
-                html.Button("Auto flow layout", id="flow-layout"),
                 html.Button("Run analysis", id="run"),
-                html.Button("Clear", id="clear"),
-                dcc.Dropdown(id="priority-select"),
-                html.Button("Move up", id="prio-up"),
-                html.Button("Move down", id="prio-down"),
             ]),
             EventListener(
                 id="canvas-events",
@@ -296,12 +394,12 @@ app.layout = html.Div([
 ])
 
 
-@app.callback(Output("priority-table", "data"), Input("state", "data"))
+@app.callback(Output("priority-table", "rowData"), Input("state", "data"))
 def show_priority(state: Dict):
     return [{"machine": x} for x in state["machine_priority"]]
 
 
-@app.callback(Output("state", "data", allow_duplicate=True), Input("priority-table", "data"), State("state", "data"), prevent_initial_call=True)
+@app.callback(Output("state", "data", allow_duplicate=True), Input("priority-table", "rowData"), State("state", "data"), prevent_initial_call=True)
 def update_priority_from_table(rows: List[Dict], state: Dict):
     st = deepcopy(state)
     if not rows:
@@ -312,21 +410,7 @@ def update_priority_from_table(rows: List[Dict], state: Dict):
     return st
 
 
-@app.callback(Output("state", "data", allow_duplicate=True), Input("prio-up", "n_clicks"), Input("prio-down", "n_clicks"), State("priority-select", "value"), State("state", "data"), prevent_initial_call=True)
-def reorder_priority(_, __, selected: str, state: Dict):
-    state = deepcopy(state)
-    order = list(state["machine_priority"])
-    if selected in order:
-        i = order.index(selected)
-        if ctx.triggered_id == "prio-up" and i > 0:
-            order[i - 1], order[i] = order[i], order[i - 1]
-        if ctx.triggered_id == "prio-down" and i < len(order) - 1:
-            order[i + 1], order[i] = order[i], order[i + 1]
-    state["machine_priority"] = order
-    return state
-
-
-@app.callback(Output("popup", "data"), Output("last-context", "data", allow_duplicate=True), Input("canvas-events", "event"), State("selected-node", "data"), State("selected-edge", "data"), State("state", "data"), State("last-context", "data"), prevent_initial_call=True)
+@app.callback(Output("popup", "data", allow_duplicate=True), Output("last-context", "data", allow_duplicate=True), Input("canvas-events", "event"), State("selected-node", "data"), State("selected-edge", "data"), State("state", "data"), State("last-context", "data"), prevent_initial_call=True)
 def canvas_event(event: Dict, selected_node: Optional[str], selected_edge: Optional[str], state: Dict, last_context: Dict):
     if not event:
         raise PreventUpdate
@@ -412,57 +496,58 @@ def select_or_connect(node_data: Dict, source: Optional[str], last_tap: Dict, st
             return st, None, node_id, None, {"node": node_id, "ts": now}, "Missing source/target"
         if any(e["source"] == source and e["target"] == node_id for e in st["edges"]):
             return st, None, node_id, None, {"node": node_id, "ts": now}, "Connection already exists."
-        item, share, err = validate_connection(st, src, tgt)
+        ok, err = validate_connection(st, src, tgt)
         if err:
             return st, None, node_id, None, {"node": node_id, "ts": now}, err
-        st["edges"].append({"id": f"e-{uuid4().hex[:6]}", "source": source, "target": node_id, "item": item, "share": share, "quality": Quality.NORMAL.value, "label": item})
-        return st, None, node_id, None, {"node": node_id, "ts": now}, f"Connected {source} -> {node_id} ({item}, share={share:.2f})"
+        if not ok:
+            return st, None, node_id, None, {"node": node_id, "ts": now}, "Connection rejected."
+        st["edges"].append({"id": f"e-{uuid4().hex[:6]}", "source": source, "target": node_id})
+        return st, None, node_id, None, {"node": node_id, "ts": now}, f"Connected {source} -> {node_id}"
 
     if is_double:
         return st, node_id, node_id, None, {"node": node_id, "ts": now}, f"Connection mode started from {node_id}. Click target node."
     return st, None, node_id, None, {"node": node_id, "ts": now}, f"Selected node {node_id}. Double-click to start connection."
 
 
-@app.callback(Output("popup", "data", allow_duplicate=True), Output("info-popup", "children"), Input("graph", "tapNodeData"), Input("graph", "tapEdgeData"), State("state", "data"), State("weights", "data"), State("analysis-data", "data"), prevent_initial_call=True)
-def open_info_popup(node_data: Optional[Dict], edge_data: Optional[Dict], state: Dict, weights: Dict, analysis_data: Dict):
+@app.callback(Output("popup", "data", allow_duplicate=True), Output("info-popup", "children"), Input("graph", "tapNodeData"), Input("graph", "tapEdgeData"), State("state", "data"), State("analysis-data", "data"), prevent_initial_call=True)
+def open_info_popup(node_data: Optional[Dict], edge_data: Optional[Dict], state: Dict, analysis_data: Dict):
     if node_data and node_data.get("id"):
         node = node_by_id(state, node_data["id"])
         if not node:
             raise PreventUpdate
         nid = node["id"]
         node_meta = (analysis_data or {}).get("nodes", {}).get(nid, {})
-        lines = [f"Node", f"kind: {node.get('kind')}"]
+        li = []
         if node.get("kind") == NodeKind.MACHINE:
-            lines += [f"machine: {machine_label(node.get('machine_type'))}", f"recipe: {node.get('recipe')}"]
+            li += [html.Li(f"machine: {machine_label(node.get('machine_type'))}"), html.Li(f"recipe: {node.get('recipe')}"), html.Li(f"quality: {node.get('quality', Quality.NORMAL.value)}")]
         else:
-            lines += [f"item: {node.get('item')}", f"mode: {node.get('io_mode')}", f"rate: {float(node.get('rate', 0.0)):.3f}/s"]
+            li += [html.Li(f"item: {node.get('item')}"), html.Li(f"mode: {node.get('io_mode')}"), html.Li(f"rate: {float(node.get('rate', 0.0)):.3f}/s"), html.Li(f"quality: {node.get('quality', Quality.NORMAL.value)}")]
         for k, v in sorted(node_meta.items()):
-            lines.append(f"{k}: {v:.4f}")
-        return {"type": "info", "open": True, "x": int(node.get("x", 20) + 20), "y": int(node.get("y", 20) + 20)}, "\n".join(lines)
+            li.append(html.Li(f"{k}: {v:.4f}"))
+        content = html.Div([html.H5("Node details", style={"margin": "0 0 6px 0"}), html.Ul(li, style={"margin": 0, "paddingLeft": "18px"})])
+        return {"type": "info", "open": True, "x": int(node.get("x", 20) + 20), "y": int(node.get("y", 20) + 20)}, content
     if edge_data and edge_data.get("id"):
-        edge = next((e for e in state["edges"] if e["id"] == edge_data["id"]), None)
+        eid = edge_data["id"]
+        edge = next((e for e in state["edges"] if e["id"] == eid), None)
+        em = (analysis_data or {}).get("edges", {}).get(eid, {})
         if not edge:
             raise PreventUpdate
-        rate = float((weights or {}).get(edge["id"], 0.0))
-        lines = [f"Edge {edge['id']}", f"{edge.get('source')} -> {edge.get('target')}", f"item: {edge.get('item')}", f"share: {float(edge.get('share', 0.0)):.3f}", f"rate: {rate:.3f}/s"]
+        req = em.get("required_rate")
+        req_txt = "none" if req is None else f"{float(req):.3f}/s"
+        li = [
+            html.Li(f"source: {edge.get('source')}"),
+            html.Li(f"target: {edge.get('target')}"),
+            html.Li(f"item: {em.get('item')}"),
+            html.Li(f"share: {float(em.get('share', 1.0)):.3f}"),
+            html.Li(f"actual rate: {float(em.get('actual_rate', 0.0)):.3f}/s"),
+            html.Li(f"required rate: {req_txt}"),
+        ]
         src = node_by_id(state, edge.get("source"))
-        return {"type": "info", "open": True, "x": int((src or {}).get("x", 20) + 80), "y": int((src or {}).get("y", 20) + 20)}, "\n".join(lines)
+        content = html.Div([html.H5("Edge details", style={"margin": "0 0 6px 0"}), html.Ul(li, style={"margin": 0, "paddingLeft": "18px"})])
+        return {"type": "info", "open": True, "x": int((src or {}).get("x", 20) + 80), "y": int((src or {}).get("y", 20) + 20)}, content
     raise PreventUpdate
 
 
-@app.callback(
-    Output("popup", "data", allow_duplicate=True),
-    Output("state", "data", allow_duplicate=True),
-    Output("selected-node", "data", allow_duplicate=True),
-    Output("selected-edge", "data", allow_duplicate=True),
-    Output("last-context", "data", allow_duplicate=True),
-    Output("status", "children", allow_duplicate=True),
-    Input("graph", "cxttapNodeData"),
-    Input("graph", "cxttapEdgeData"),
-    State("state", "data"),
-    State("last-context", "data"),
-    prevent_initial_call=True,
-)
 def right_click_config_or_delete(node_data: Optional[Dict], edge_data: Optional[Dict], state: Dict, last_context: Dict):
     st = deepcopy(state)
     now = time.time()
@@ -492,8 +577,9 @@ def select_edge(edge_data: Dict, state: Dict, weights: Dict):
     edge = next((e for e in state["edges"] if e["id"] == edge_data["id"]), None)
     if not edge:
         raise PreventUpdate
+    sem = derive_edge_semantics(state, edge) or {}
     rate = float((weights or {}).get(edge["id"], 0.0))
-    return edge["id"], f"{edge.get('item')} • quality {edge.get('quality', Quality.NORMAL.value)} • calculated rate: {rate:.3f}/s"
+    return edge["id"], f"{sem.get('item')} • quality {sem.get('quality', Quality.NORMAL.value)} • calculated rate: {rate:.3f}/s"
 
 
 @app.callback(Output("selected-node-label", "children"), Input("selected-node", "data"), State("state", "data"))
@@ -557,15 +643,7 @@ def populate_node_popup(popup: Dict, selected_node: Optional[str], state: Dict):
     if not node:
         return None, None, None, None, None, None, None, []
 
-    sliders = []
-    outgoing = [e for e in state["edges"] if e["source"] == selected_node]
-    for edge in outgoing:
-        sliders.append(
-            html.Div([
-                html.Div(f"{edge.get('item')} -> {edge.get('target')}", style={"fontSize": "11px"}),
-                dcc.Slider(id={"type": "share-slider", "edge_id": edge["id"]}, min=0.0, max=1.0, step=0.01, value=float(edge.get("share", 1.0))),
-            ], style={"marginBottom": "8px"})
-        )
+    sliders = [html.Div("Edge attributes are derived from connected nodes.", style={"fontSize": "11px", "color": "#64748b"})]
 
     if node["kind"] == NodeKind.MACHINE:
         return node.get("machine_type"), node.get("recipe"), None, None, None, node.get("quality", "normal"), node.get("count"), sliders
@@ -581,25 +659,7 @@ def populate_node_popup(popup: Dict, selected_node: Optional[str], state: Dict):
     prevent_initial_call=True,
 )
 def update_shares(slider_values: List[float], slider_ids: List[Dict], selected_node: Optional[str], state: Dict):
-    if not selected_node or not slider_ids:
-        raise PreventUpdate
-    st = deepcopy(state)
-    value_by_edge = {sid["edge_id"]: float(val) for sid, val in zip(slider_ids, slider_values)}
-
-    # Apply then renormalize shares per item group to sum <= 1.
-    grouped: Dict[str, List[Dict]] = {}
-    for edge in st["edges"]:
-        if edge["source"] == selected_node and edge["id"] in value_by_edge:
-            edge["share"] = value_by_edge[edge["id"]]
-            grouped.setdefault(edge.get("item", ""), []).append(edge)
-
-    for _, edges in grouped.items():
-        total = sum(float(e.get("share", 0.0)) for e in edges)
-        if total > 1.0 and total > 1e-9:
-            for e in edges:
-                e["share"] = float(e.get("share", 0.0)) / total
-
-    return st
+    raise PreventUpdate
 
 @app.callback(Output("state", "data", allow_duplicate=True), Output("status", "children", allow_duplicate=True), Input("load-demo", "n_clicks"), prevent_initial_call=True)
 def load_demo(_):
@@ -631,26 +691,9 @@ def run_analysis(_, state: Dict):
         graph = build_fqc_graph(state)
         graph.backcalculate_requirements(mode="fractional")
         report = MachineAnalysis().analyze(graph)
-        weights: Dict[str, float] = {}
-        for e in state["edges"]:
-            src = node_by_id(state, e["source"])
-            tgt = node_by_id(state, e["target"])
-            if src and src.get("kind") == NodeKind.IO:
-                weights[e["id"]] = max(0.1, float(src.get("rate", 0.0)))
-                continue
-            if tgt and tgt.get("kind") == NodeKind.IO:
-                weights[e["id"]] = max(0.1, float(tgt.get("rate", 0.0)))
-                continue
-            s = report.machines.get(e["source"])
-            t = report.machines.get(e["target"])
-            if s and t and e.get("item"):
-                try:
-                    it = Item(e["item"])
-                    weights[e["id"]] = max(0.1, min(float(s.production_rates.get(it, 0.0)), float(t.consumption_rates.get(it, 0.0))))
-                except Exception:
-                    weights[e["id"]] = max(0.1, float(e.get("share", 1.0)))
-            else:
-                weights[e["id"]] = max(0.1, float(e.get("share", 1.0)))
+        has_demands = len(getattr(graph, "target_outputs", {})) > 0
+        edge_meta = compute_edge_metrics(state, report, has_demands)
+        weights: Dict[str, float] = {eid: max(0.1, float(meta.get("actual_rate", 0.0))) for eid, meta in edge_meta.items()}
 
         ext_rows = [{"item": i.value, "quality": q.value, "rate": r} for (i, q), r in graph.required_external_inputs.items()]
         ui = [
@@ -671,7 +714,6 @@ def run_analysis(_, state: Dict):
                 item_name = item[0].value if isinstance(item, tuple) else item.value
                 fields[f"actual_output_{item_name}"] = float(rate)
             node_meta[mid] = fields
-        edge_meta = {e["id"]: {"source": e["source"], "target": e["target"], "item": e.get("item"), "share": float(e.get("share", 0.0)), "rate": float(weights.get(e["id"], 0.0))} for e in state["edges"]}
         return weights, {"nodes": node_meta, "edges": edge_meta}, ui
     except Exception as exc:
         return {}, {}, [html.Pre(str(exc))]
@@ -716,9 +758,9 @@ def flow_layout(_, state: Dict):
     return apply_flow_layout(state), "Applied flow layout."
 
 
-@app.callback(Output("graph", "elements"), Input("state", "data"), Input("weights", "data"))
-def render(state: Dict, weights: Dict):
-    return make_cyto_elements(state, weights)
+@app.callback(Output("graph", "elements"), Input("state", "data"), Input("weights", "data"), Input("analysis-data", "data"))
+def render(state: Dict, weights: Dict, analysis_data: Dict):
+    return make_cyto_elements(state, weights, (analysis_data or {}).get("edges", {}))
 
 
 if __name__ == "__main__":
