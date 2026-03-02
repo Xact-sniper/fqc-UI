@@ -1,0 +1,4 @@
+dash>=2.18
+dash-cytoscape>=1.0.2
+dash-extensions>=1.0.18
+pandas>=2.2
