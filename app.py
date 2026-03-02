@@ -144,7 +144,7 @@ def build_fqc_graph(state: Dict) -> CraftingGraph:
         machine_ids.add(node["id"])
     for edge in state["edges"]:
         if edge["source"] in machine_ids and edge["target"] in machine_ids:
-            q = None if edge.get("quality", "(any)") == "(any)" else Quality(edge["quality"])
+            q = Quality(edge.get("quality", Quality.NORMAL.value))
             graph.add_edge(Edge(source=edge["source"], target=edge["target"], item=Item(edge["item"]), share=float(edge.get("share", 1.0)), quality=q))
     for io in state["nodes"]:
         if io["kind"] != NodeKind.IO:
@@ -197,7 +197,7 @@ def validate_connection(state: Dict, source: Dict, target: Dict) -> Tuple[Option
             return None, None, f"{item} is not produced by {source.get('recipe')}."
         share = _remaining_share(state, source["id"], item)
         if share <= 0:
-            return None, None, f"No share left for {item} from {source['id']}."
+            return item, 0.0, ""
         return item, share, ""
 
     tgt_inputs = RECIPE_INPUTS.get(target.get("recipe"), set())
@@ -206,7 +206,14 @@ def validate_connection(state: Dict, source: Dict, target: Dict) -> Tuple[Option
             share = _remaining_share(state, source["id"], item)
             if share > 0:
                 return item, share, ""
+            return item, 0.0, ""
     return None, None, "No valid item/share found for this machine connection."
+
+
+def machine_label(machine_type: Optional[str]) -> str:
+    if not machine_type:
+        return "Machine"
+    return machine_type.replace("-", " ").title()
 
 
 app = Dash(__name__)
@@ -225,25 +232,27 @@ app.layout = html.Div([
     html.Div(style={"display": "flex", "height": "100vh", "fontFamily": "sans-serif"}, children=[
         html.Div(style={"width": "300px", "borderRight": "1px solid #ddd", "padding": "10px", "overflowY": "auto"}, children=[
             html.H4("Machine priority"),
-            dash_table.DataTable(id="priority-table", columns=[{"name": "machine", "id": "machine"}], data=[]),
-            dcc.Dropdown(id="priority-select"),
-            html.Button("Move up", id="prio-up"),
-            html.Button("Move down", id="prio-down", style={"marginLeft": "8px"}),
-            html.Hr(),
-            html.Div("Selected node"),
-            html.Div(id="selected-node-label", style={"fontSize": "12px"}),
-            html.Div("Selected edge"),
-            html.Div(id="edge-rate", style={"fontSize": "12px", "padding": "6px 0", "color": "#444"}),
-            html.Div(id="hover-info", style={"fontSize": "11px", "whiteSpace": "pre-wrap", "color": "#334155"}),
-            html.Div("Left click node to configure. Right click node/edge to delete.", style={"fontSize": "11px", "color": "#666"}),
-            html.Hr(),
-            html.Button("Load demo graph", id="load-demo", style={"width": "100%"}),
-            html.Button("Auto flow layout", id="flow-layout", style={"width": "100%", "marginTop": "6px"}),
-            html.Button("Run analysis", id="run", style={"width": "100%", "marginTop": "6px"}),
-            html.Button("Clear", id="clear", style={"width": "100%", "marginTop": "6px"}),
-            html.Pre(id="status", style={"fontSize": "12px", "whiteSpace": "pre-wrap"}),
+            dash_table.DataTable(
+                id="priority-table",
+                columns=[{"name": "machine", "id": "machine"}],
+                data=[],
+                editable=True,
+            ),
         ]),
         html.Div(style={"flex": "1", "position": "relative", "display": "flex", "flexDirection": "column"}, children=[
+            html.Div(style={"display": "none"}, children=[
+                html.Div(id="selected-node-label"),
+                html.Div(id="edge-rate"),
+                html.Div(id="hover-info"),
+                html.Pre(id="status"),
+                html.Button("Load demo graph", id="load-demo"),
+                html.Button("Auto flow layout", id="flow-layout"),
+                html.Button("Run analysis", id="run"),
+                html.Button("Clear", id="clear"),
+                dcc.Dropdown(id="priority-select"),
+                html.Button("Move up", id="prio-up"),
+                html.Button("Move down", id="prio-down"),
+            ]),
             EventListener(
                 id="canvas-events",
                 events=[
@@ -265,7 +274,7 @@ app.layout = html.Div([
                 ),
             ),
             html.Div(id="analysis", style={"padding": "8px", "overflowY": "auto"}),
-            html.Div(id="recipe-popup", style={"position": "absolute", "display": "none", "background": "white", "border": "1px solid #ccc", "padding": "8px", "zIndex": 10}, children=[html.B("Add machine"), dcc.Dropdown(id="recipe-select", options=[{"label": r, "value": r} for r in RECIPE_OPTIONS], style={"width": "320px"}), html.Button("Create", id="create-recipe-node")]),
+            html.Div(id="recipe-popup", style={"position": "absolute", "display": "none", "background": "white", "border": "1px solid #ccc", "padding": "8px", "zIndex": 10}, children=[html.B("Add machine"), dcc.Dropdown(id="recipe-select", options=[{"label": r, "value": r} for r in RECIPE_OPTIONS], style={"width": "320px"}), dcc.Dropdown(id="recipe-quality", options=[{"label": q.value, "value": q.value} for q in Quality], value=Quality.NORMAL.value), html.Button("Create", id="create-recipe-node")]),
             html.Div(id="item-popup", style={"position": "absolute", "display": "none", "background": "white", "border": "1px solid #ccc", "padding": "8px", "zIndex": 10}, children=[html.B("Add I/O"), dcc.Dropdown(id="item-select", options=[{"label": i, "value": i} for i in ITEM_OPTIONS], value=Item.IRON_PLATE.value), dcc.Dropdown(id="io-mode", options=[{"label": "input", "value": "input"}, {"label": "output", "value": "output"}, {"label": "throughput", "value": "throughput"}], value="input"), dcc.Input(id="io-rate", type="number", value=1.0, style={"width": "100%"}), dcc.Dropdown(id="io-quality", options=[{"label": q.value, "value": q.value} for q in Quality], value=Quality.NORMAL.value), html.Button("Create", id="create-io-node")]),
             html.Div(id="info-popup", style={"position": "absolute", "display": "none", "background": "white", "border": "1px solid #94a3b8", "padding": "8px", "zIndex": 12, "maxWidth": "420px", "whiteSpace": "pre-wrap", "fontSize": "11px"}),
 
@@ -287,10 +296,20 @@ app.layout = html.Div([
 ])
 
 
-@app.callback(Output("priority-table", "data"), Output("priority-select", "options"), Output("priority-select", "value"), Input("state", "data"))
+@app.callback(Output("priority-table", "data"), Input("state", "data"))
 def show_priority(state: Dict):
-    opts = [{"label": x, "value": x} for x in state["machine_priority"]]
-    return [{"machine": x} for x in state["machine_priority"]], opts, opts[0]["value"] if opts else None
+    return [{"machine": x} for x in state["machine_priority"]]
+
+
+@app.callback(Output("state", "data", allow_duplicate=True), Input("priority-table", "data"), State("state", "data"), prevent_initial_call=True)
+def update_priority_from_table(rows: List[Dict], state: Dict):
+    st = deepcopy(state)
+    if not rows:
+        return st
+    ordered = [r.get("machine") for r in rows if r.get("machine") in [m.value for m in MachineType]]
+    if ordered:
+        st["machine_priority"] = ordered
+    return st
 
 
 @app.callback(Output("state", "data", allow_duplicate=True), Input("prio-up", "n_clicks"), Input("prio-down", "n_clicks"), State("priority-select", "value"), State("state", "data"), prevent_initial_call=True)
@@ -309,14 +328,16 @@ def reorder_priority(_, __, selected: str, state: Dict):
 
 @app.callback(Output("popup", "data"), Output("last-context", "data", allow_duplicate=True), Input("canvas-events", "event"), State("selected-node", "data"), State("selected-edge", "data"), State("state", "data"), State("last-context", "data"), prevent_initial_call=True)
 def canvas_event(event: Dict, selected_node: Optional[str], selected_edge: Optional[str], state: Dict, last_context: Dict):
+    if not event:
+        raise PreventUpdate
     xy = {"x": int(event.get("offsetX", 20)), "y": int(event.get("offsetY", 20))}
     if event.get("event") == "contextmenu":
-        return {"type": None, "open": False, "x": xy["x"], "y": xy["y"]}, last_context
+        raise PreventUpdate
     if event.get("shiftKey"):
         return {"type": "recipe", "open": True, "x": xy["x"], "y": xy["y"]}, last_context
     if event.get("ctrlKey"):
         return {"type": "io", "open": True, "x": xy["x"], "y": xy["y"]}, last_context
-    return {"type": None, "open": False, "x": xy["x"], "y": xy["y"]}, last_context
+    raise PreventUpdate
 
 
 @app.callback(Output("recipe-popup", "style"), Output("item-popup", "style"), Output("node-config-popup", "style"), Output("info-popup", "style"), Input("popup", "data"))
@@ -333,14 +354,14 @@ def popup_style(popup: Dict):
     return r, i, n, info
 
 
-@app.callback(Output("state", "data", allow_duplicate=True), Output("popup", "data", allow_duplicate=True), Output("status", "children", allow_duplicate=True), Input("create-recipe-node", "n_clicks"), State("recipe-select", "value"), State("popup", "data"), State("state", "data"), prevent_initial_call=True)
-def create_recipe(_, recipe: Optional[str], popup: Dict, state: Dict):
+@app.callback(Output("state", "data", allow_duplicate=True), Output("popup", "data", allow_duplicate=True), Output("status", "children", allow_duplicate=True), Input("create-recipe-node", "n_clicks"), State("recipe-select", "value"), State("recipe-quality", "value"), State("popup", "data"), State("state", "data"), prevent_initial_call=True)
+def create_recipe(_, recipe: Optional[str], recipe_quality: Optional[str], popup: Dict, state: Dict):
     if not recipe:
         return state, popup, "Pick a recipe."
     st = deepcopy(state)
     nid = f"m-{uuid4().hex[:6]}"
     mt = choose_machine_for_recipe(recipe, st["machine_priority"])
-    st["nodes"].append({"id": nid, "kind": NodeKind.MACHINE, "label": recipe, "recipe": recipe, "machine_type": mt, "quality": "normal", "count": None, "x": popup["x"], "y": popup["y"]})
+    st["nodes"].append({"id": nid, "kind": NodeKind.MACHINE, "label": recipe, "recipe": recipe, "machine_type": mt, "quality": recipe_quality or Quality.NORMAL.value, "count": None, "x": popup["x"], "y": popup["y"]})
     return st, {"type": None, "open": False, "x": popup["x"], "y": popup["y"]}, f"Created machine {nid}."
 
 
@@ -394,7 +415,7 @@ def select_or_connect(node_data: Dict, source: Optional[str], last_tap: Dict, st
         item, share, err = validate_connection(st, src, tgt)
         if err:
             return st, None, node_id, None, {"node": node_id, "ts": now}, err
-        st["edges"].append({"id": f"e-{uuid4().hex[:6]}", "source": source, "target": node_id, "item": item, "share": share, "quality": "(any)", "label": item})
+        st["edges"].append({"id": f"e-{uuid4().hex[:6]}", "source": source, "target": node_id, "item": item, "share": share, "quality": Quality.NORMAL.value, "label": item})
         return st, None, node_id, None, {"node": node_id, "ts": now}, f"Connected {source} -> {node_id} ({item}, share={share:.2f})"
 
     if is_double:
@@ -410,9 +431,9 @@ def open_info_popup(node_data: Optional[Dict], edge_data: Optional[Dict], state:
             raise PreventUpdate
         nid = node["id"]
         node_meta = (analysis_data or {}).get("nodes", {}).get(nid, {})
-        lines = [f"Node {nid}", f"kind: {node.get('kind')}"]
+        lines = [f"Node", f"kind: {node.get('kind')}"]
         if node.get("kind") == NodeKind.MACHINE:
-            lines += [f"recipe: {node.get('recipe')}", f"machine: {node.get('machine_type')}"]
+            lines += [f"machine: {machine_label(node.get('machine_type'))}", f"recipe: {node.get('recipe')}"]
         else:
             lines += [f"item: {node.get('item')}", f"mode: {node.get('io_mode')}", f"rate: {float(node.get('rate', 0.0)):.3f}/s"]
         for k, v in sorted(node_meta.items()):
@@ -472,7 +493,7 @@ def select_edge(edge_data: Dict, state: Dict, weights: Dict):
     if not edge:
         raise PreventUpdate
     rate = float((weights or {}).get(edge["id"], 0.0))
-    return edge["id"], f"{edge.get('item')} • quality {edge.get('quality', '(any)')} • calculated rate: {rate:.3f}/s"
+    return edge["id"], f"{edge.get('item')} • quality {edge.get('quality', Quality.NORMAL.value)} • calculated rate: {rate:.3f}/s"
 
 
 @app.callback(Output("selected-node-label", "children"), Input("selected-node", "data"), State("state", "data"))
@@ -590,9 +611,9 @@ def load_demo(_):
             {"id": "io2", "kind": NodeKind.IO, "label": "output\nautomation-science-pack", "item": Item.AUTOMATION_SCIENCE_PACK.value, "io_mode": "output", "rate": 1.0, "quality": Quality.NORMAL.value, "x": 950, "y": 180},
         ],
         "edges": [
-            {"id": "e1", "source": "io1", "target": "m1", "item": Item.IRON_PLATE.value, "share": 1.0, "quality": "(any)", "label": Item.IRON_PLATE.value},
-            {"id": "e2", "source": "m1", "target": "m2", "item": Item.IRON_GEAR_WHEEL.value, "share": 1.0, "quality": "(any)", "label": Item.IRON_GEAR_WHEEL.value},
-            {"id": "e3", "source": "m2", "target": "io2", "item": Item.AUTOMATION_SCIENCE_PACK.value, "share": 1.0, "quality": "(any)", "label": Item.AUTOMATION_SCIENCE_PACK.value},
+            {"id": "e1", "source": "io1", "target": "m1", "item": Item.IRON_PLATE.value, "share": 1.0, "quality": Quality.NORMAL.value, "label": Item.IRON_PLATE.value},
+            {"id": "e2", "source": "m1", "target": "m2", "item": Item.IRON_GEAR_WHEEL.value, "share": 1.0, "quality": Quality.NORMAL.value, "label": Item.IRON_GEAR_WHEEL.value},
+            {"id": "e3", "source": "m2", "target": "io2", "item": Item.AUTOMATION_SCIENCE_PACK.value, "share": 1.0, "quality": Quality.NORMAL.value, "label": Item.AUTOMATION_SCIENCE_PACK.value},
         ],
         "machine_priority": [m.value for m in MachineType],
     }
@@ -631,18 +652,24 @@ def run_analysis(_, state: Dict):
             else:
                 weights[e["id"]] = max(0.1, float(e.get("share", 1.0)))
 
-        machine_rows = [{"machine_id": mid, "count": m.count, "run_rate": m.required_run_rate} for mid, m in graph.machines.items()]
         ext_rows = [{"item": i.value, "quality": q.value, "rate": r} for (i, q), r in graph.required_external_inputs.items()]
-        ui = [html.H4("Machines"), dash_table.DataTable(data=pd.DataFrame(machine_rows).to_dict("records"), page_size=8), html.H4("Required external inputs"), dash_table.DataTable(data=pd.DataFrame(ext_rows).to_dict("records"), page_size=8)]
+        ui = [
+            html.H4("Graph-level demand/supply"),
+            html.Div(f"Machines in graph: {len(graph.machines)}"),
+            html.H5("Required external inputs"),
+            dash_table.DataTable(data=pd.DataFrame(ext_rows).to_dict("records"), page_size=8),
+        ]
         node_meta: Dict[str, Dict[str, float]] = {}
         for mid, m in report.machines.items():
             fields: Dict[str, float] = {}
-            for name in dir(m):
-                if not (name.startswith("required_") or name.startswith("actual_")):
-                    continue
-                value = getattr(m, name, None)
-                if isinstance(value, (int, float)):
-                    fields[name] = float(value)
+            fields["required_machine_count"] = float(getattr(m, "count", 0.0) or 0.0)
+            fields["required_run_rate"] = float(getattr(m, "required_run_rate", 0.0) or 0.0)
+            for item, rate in getattr(m, "consumption_rates", {}).items():
+                item_name = item[0].value if isinstance(item, tuple) else item.value
+                fields[f"required_input_{item_name}"] = float(rate)
+            for item, rate in getattr(m, "production_rates", {}).items():
+                item_name = item[0].value if isinstance(item, tuple) else item.value
+                fields[f"actual_output_{item_name}"] = float(rate)
             node_meta[mid] = fields
         edge_meta = {e["id"]: {"source": e["source"], "target": e["target"], "item": e.get("item"), "share": float(e.get("share", 0.0)), "rate": float(weights.get(e["id"], 0.0))} for e in state["edges"]}
         return weights, {"nodes": node_meta, "edges": edge_meta}, ui
